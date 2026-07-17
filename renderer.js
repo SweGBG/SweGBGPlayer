@@ -197,17 +197,46 @@
   document.getElementById('btn-maximize').addEventListener('click', () => window.api.windowMaximize());
   document.getElementById('btn-close').addEventListener('click', () => window.api.windowClose());
 
-  // ── Drop zone ──
+  // ── Drop zone: whole window accepts dropped media files ──
+  const MEDIA_EXT_RE = /\.(mp4|webm|mkv|avi|mov|wmv|flv|ogv|m4v|3gp|mp3|wav|ogg|flac|aac|m4a|wma)$/i;
+  const SUB_EXT_RE = /\.(srt|vtt|sub|ssa|ass)$/i;
+
   dropZone.addEventListener('click', openFileDialog);
-  dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); });
-  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
-  dropZone.addEventListener('drop', (e) => {
+
+  document.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropZone.classList.add('drag-over');
+  });
+  document.addEventListener('dragleave', (e) => {
+    if (!e.relatedTarget) dropZone.classList.remove('drag-over');
+  });
+  document.addEventListener('drop', async (e) => {
     e.preventDefault();
     dropZone.classList.remove('drag-over');
-    const files = Array.from(e.dataTransfer.files);
-    if (files.length > 0) {
-      addFilesToPlaylist(files.map(f => ({ name: f.name, path: f.path })));
-      playIndex(playlist.length - files.length);
+    const dropped = Array.from(e.dataTransfer.files)
+      .map(f => ({ name: f.name, path: window.api.getPathForFile(f) }))
+      .filter(f => f.path);
+
+    // Dropped subtitle file: load it onto the current video
+    for (const f of dropped.filter(f => SUB_EXT_RE.test(f.name))) {
+      const res = await window.api.readSubtitleFile(f.path);
+      if (res.success) {
+        const parsed = parseSubtitle(res.content, res.ext);
+        if (parsed.length > 0) {
+          loadedSubtitles.push({ name: f.name, cues: parsed, path: f.path });
+          activeSubtitleIdx = loadedSubtitles.length - 1;
+          subtitles = parsed;
+          updateSubButton();
+        }
+      }
+    }
+
+    const media = dropped.filter(f => MEDIA_EXT_RE.test(f.name));
+    if (media.length > 0) {
+      const startAt = playlist.length;
+      addFilesToPlaylist(media);
+      const firstNew = playlist.findIndex(p => p.path === media[0].path);
+      playIndex(firstNew >= 0 ? firstNew : startAt);
     }
   });
 
@@ -1132,6 +1161,8 @@
     grabberPanel.classList.toggle('hidden');
     if (!grabberPanel.classList.contains('hidden')) grabberUrl.focus();
   }
+
+  document.getElementById('btn-grabber').addEventListener('click', toggleGrabberPanel);
 
   document.getElementById('btn-close-grabber-panel').addEventListener('click', () => {
     grabberPanel.classList.add('hidden');

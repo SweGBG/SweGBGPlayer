@@ -1,6 +1,9 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
+  // File.path was removed in modern Electron; this is the supported way to
+  // resolve a dropped File object to its absolute path
+  getPathForFile: (file) => webUtils.getPathForFile(file),
   openFile: () => ipcRenderer.invoke('open-file'),
   openSubtitle: () => ipcRenderer.invoke('open-subtitle'),
   readSubtitleFile: (path) => ipcRenderer.invoke('read-subtitle-file', path),
