@@ -2,6 +2,16 @@
 
 Media player (Electron) with automatic subtitle download and a built-in **Music Grabber** extension (yt-dlp based downloads straight into the playlist).
 
+## ⬇ Download (Windows)
+
+**[Download SweGBGPlayer-Setup.exe](https://github.com/SweGBG/SweGBGPlayer/releases/latest/download/SweGBGPlayer-Setup.exe)** — just run the installer, no other steps needed.
+
+Windows 10/11, 64-bit. The installer is unsigned, so SmartScreen may ask you to confirm ("More info" → "Run anyway").
+
+*Everything below this line is for developers who want to build from source.*
+
+---
+
 ## Features
 - Plays MP4, WebM, MKV, AVI, MOV, MP3, WAV, OGG, FLAC and more
 - Playlist sidebar with add files / add folders
