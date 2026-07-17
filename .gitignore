@@ -1,0 +1,4 @@
+node_modules/
+release/
+tools/bin/
+*.log
