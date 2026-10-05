@@ -1243,6 +1243,9 @@
       refs.meta.textContent = 'Converting to MP3...';
     } else if (line.startsWith('[Merger]')) {
       refs.meta.textContent = 'Merging video...';
+    } else if (line === '[swegbg] updating') {
+      refs.fill.style.width = '0%';
+      refs.meta.textContent = 'Updating downloader, retrying...';
     }
   });
 

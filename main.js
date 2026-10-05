@@ -370,7 +370,72 @@ ipcMain.handle('grabber-open-dir', (event, dir) => {
 const grabberJobs = new Map();
 let grabberJobSeq = 0;
 
-ipcMain.handle('grabber-start', (event, { url, format, outDir }) => {
+// ── Self-updating yt-dlp ──
+// The installer puts yt-dlp under Program Files, where normal users can't write, so it
+// can never update itself there. We keep a working copy in the user's AppData instead,
+// seed it from the bundled exe and run `yt-dlp -U` on startup and after a failed download.
+function userYtdlpPath() {
+  return path.join(app.getPath('userData'), 'tools', 'yt-dlp.exe');
+}
+
+function ensureUserYtdlp() {
+  const target = userYtdlpPath();
+  if (fs.existsSync(target)) return target;
+  const bundledDir = findToolsDir();
+  if (!bundledDir) return null;
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(path.join(bundledDir, 'yt-dlp.exe'), target);
+    return target;
+  } catch (e) {
+    console.error('Could not copy yt-dlp to AppData:', e.message);
+    return path.join(bundledDir, 'yt-dlp.exe'); // fall back to the bundled copy
+  }
+}
+
+let ytdlpUpdate = null; // in-flight update promise, shared by everyone who needs it
+let ytdlpLastUpdate = 0;
+
+function updateYtdlp(force = false) {
+  if (ytdlpUpdate) return ytdlpUpdate;
+  if (!force && Date.now() - ytdlpLastUpdate < 6 * 3600 * 1000) return Promise.resolve(false);
+  const exe = ensureUserYtdlp();
+  if (!exe) return Promise.resolve(false);
+  ytdlpUpdate = new Promise((resolve) => {
+    let out = '';
+    const proc = spawn(exe, ['-U', '--no-check-certificates'], { windowsHide: true });
+    proc.stdout.on('data', (d) => { out += d; });
+    proc.stderr.on('data', (d) => { out += d; });
+    const timer = setTimeout(() => proc.kill(), 120000);
+    const finish = (ok) => {
+      clearTimeout(timer);
+      ytdlpLastUpdate = Date.now();
+      ytdlpUpdate = null;
+      console.log('[yt-dlp -U]', out.trim());
+      resolve(ok && /Updated yt-dlp to/i.test(out));
+    };
+    proc.on('close', (code) => finish(code === 0));
+    proc.on('error', () => finish(false));
+  });
+  return ytdlpUpdate;
+}
+
+app.whenReady().then(() => {
+  // Don't slow down startup: update quietly a few seconds after launch.
+  setTimeout(() => updateYtdlp(true), 4000);
+});
+
+// yt-dlp needs a JavaScript runtime to unlock YouTube formats. Electron *is* Node, so we
+// hand it our own exe and set ELECTRON_RUN_AS_NODE: works without Node installed.
+function jsRuntimeArgs() {
+  return ['--js-runtimes', 'node:' + process.execPath];
+}
+const ytdlpEnv = () => ({ ...process.env, ELECTRON_RUN_AS_NODE: '1' });
+
+// Errors that usually mean "yt-dlp is out of date" → update and retry once.
+const STALE_RE = /HTTP Error 403|Sign in to confirm|nsig|n challenge|Requested format is not available|Unable to extract|Precondition check failed|HTTP Error 400/i;
+
+ipcMain.handle('grabber-start', async (event, { url, format, outDir }) => {
   const toolsDir = findToolsDir();
   if (!toolsDir) return { success: false, error: 'yt-dlp.exe not found (tools\\bin)' };
   try { fs.mkdirSync(outDir, { recursive: true }); } catch (e) {
@@ -381,10 +446,9 @@ ipcMain.handle('grabber-start', (event, { url, format, outDir }) => {
   const args = [
     '--no-playlist',
     '--newline',
-    // AV/proxy HTTPS inspection breaks yt-dlp's cert chain on this machine
+    // AV/proxy HTTPS inspection breaks yt-dlp's cert chain on some machines
     '--no-check-certificates',
-    // Use installed Node.js as JS runtime so YouTube serves all formats
-    '--js-runtimes', 'node',
+    ...jsRuntimeArgs(),
     '--ffmpeg-location', toolsDir,
     '-o', path.join(outDir, '%(title)s.%(ext)s')
   ];
@@ -395,67 +459,75 @@ ipcMain.handle('grabber-start', (event, { url, format, outDir }) => {
   }
   args.push(url);
 
-  const proc = spawn(path.join(toolsDir, 'yt-dlp.exe'), args, { windowsHide: true });
-  grabberJobs.set(jobId, proc);
-
-  let lastDestination = null;
-  let errorTail = '';
-
-  const handleLine = (line) => {
-    line = line.trim();
-    if (!line) return;
-    const dest = line.match(/^\[(?:download|ExtractAudio|Merger)\]\s+(?:Destination:\s+|Merging formats into ")(.+?)"?$/);
-    if (dest) lastDestination = dest[1];
-    const prog = line.match(/^\[download\]\s+([\d.]+)%/);
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('grabber-progress', {
-        jobId,
-        percent: prog ? parseFloat(prog[1]) : null,
-        line
-      });
-    }
+  const send = (channel, data) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, { jobId, ...data });
   };
 
-  let stdoutBuf = '';
-  proc.stdout.on('data', (d) => {
-    stdoutBuf += d.toString();
-    const lines = stdoutBuf.split(/\r?\n/);
-    stdoutBuf = lines.pop();
-    lines.forEach(handleLine);
-  });
-  proc.stderr.on('data', (d) => {
-    errorTail = (errorTail + d.toString()).slice(-2000);
-  });
+  const run = async (attempt) => {
+    // Never run while the exe is being replaced by an update.
+    if (ytdlpUpdate) {
+      send('grabber-progress', { percent: null, line: '[swegbg] updating' });
+      await ytdlpUpdate;
+    }
+    if (!grabberJobs.has(jobId)) return; // cancelled while waiting
+    const exe = ensureUserYtdlp() || path.join(toolsDir, 'yt-dlp.exe');
+    const proc = spawn(exe, args, { windowsHide: true, env: ytdlpEnv() });
+    grabberJobs.set(jobId, proc);
 
-  proc.on('close', (code) => {
-    grabberJobs.delete(jobId);
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('grabber-done', {
-        jobId,
+    let lastDestination = null;
+    let errorTail = '';
+
+    const handleLine = (line) => {
+      line = line.trim();
+      if (!line) return;
+      const dest = line.match(/^\[(?:download|ExtractAudio|Merger)\]\s+(?:Destination:\s+|Merging formats into ")(.+?)"?$/);
+      if (dest) lastDestination = dest[1];
+      const prog = line.match(/^\[download\]\s+([\d.]+)%/);
+      send('grabber-progress', { percent: prog ? parseFloat(prog[1]) : null, line });
+    };
+
+    let stdoutBuf = '';
+    proc.stdout.on('data', (d) => {
+      stdoutBuf += d.toString();
+      const lines = stdoutBuf.split(/\r?\n/);
+      stdoutBuf = lines.pop();
+      lines.forEach(handleLine);
+    });
+    proc.stderr.on('data', (d) => {
+      errorTail = (errorTail + d.toString()).slice(-2000);
+    });
+
+    proc.on('close', async (code) => {
+      if (grabberJobs.get(jobId) !== proc) return; // cancelled
+      if (code !== 0 && attempt === 0 && STALE_RE.test(errorTail)) {
+        send('grabber-progress', { percent: null, line: '[swegbg] updating' });
+        await updateYtdlp(true);
+        return run(1);
+      }
+      grabberJobs.delete(jobId);
+      send('grabber-done', {
         success: code === 0,
         filePath: lastDestination,
         error: code === 0 ? null : (errorTail.trim().split('\n').pop() || `yt-dlp exited with code ${code}`)
       });
-    }
-  });
-  proc.on('error', (e) => {
-    grabberJobs.delete(jobId);
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('grabber-done', { jobId, success: false, filePath: null, error: e.message });
-    }
-  });
+    });
+    proc.on('error', (e) => {
+      grabberJobs.delete(jobId);
+      send('grabber-done', { success: false, filePath: null, error: e.message });
+    });
+  };
 
+  grabberJobs.set(jobId, null); // reserve the slot so cancel works while waiting
+  run(0);
   return { success: true, jobId };
 });
 
 ipcMain.handle('grabber-cancel', (event, jobId) => {
+  if (!grabberJobs.has(jobId)) return false;
   const proc = grabberJobs.get(jobId);
-  if (proc) {
-    proc.kill();
-    grabberJobs.delete(jobId);
-    return true;
-  }
-  return false;
+  grabberJobs.delete(jobId);
+  if (proc) proc.kill();
+  return true;
 });
 
 ipcMain.handle('list-media-files', async (event, dirPath) => {
